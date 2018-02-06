@@ -1,0 +1,222 @@
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+import scipy.misc
+
+from keras.utils import plot_model
+from keras.preprocessing.image import ImageDataGenerator
+from keras.models import Model, Sequential
+from keras.layers import Input, Dropout, Activation, LSTM, Conv2D, Conv2DTranspose, Dense, TimeDistributed, Flatten, Reshape, Cropping2D, GaussianNoise, Concatenate, BatchNormalization, SeparableConv2D, MaxPooling2D, UpSampling2D, ZeroPadding2D
+from keras.losses import mean_squared_error
+from keras.optimizers import Adadelta, RMSprop
+from keras import backend as K
+from keras.layers.advanced_activations import LeakyReLU
+from keras.models import load_model
+
+#K.set_learning_phase(1) #set learning phase
+
+sequences_per_batch = 1
+epochs = 100
+image_size = 240
+sequence_length = 155
+sequence_start = 0
+train_seq = 1
+train_cnt = int(sequence_length / train_seq)
+file_list = 'train.txt'
+input_mode = 'train'
+input_data = 4
+input_attention = 3
+input_dimension = input_data + input_attention
+output_dimension = 3
+base = 42
+folder = 'data'
+
+# load data list
+files = np.genfromtxt(file_list, dtype='str')
+
+# define model
+def conv_block(m, dim, acti, bn, res, do=0.2):
+    n = TimeDistributed(Conv2D(dim, 6, padding='same'))(m)
+    n = TimeDistributed(LeakyReLU())(n)
+    n = BatchNormalization()(n) if bn else n
+    n = TimeDistributed(Dropout(do))(n) if do else n
+    n = TimeDistributed(Conv2D(dim, 6, padding='same'))(n)
+    n = TimeDistributed(LeakyReLU())(n)
+    n = BatchNormalization()(n) if bn else n
+    return Concatenate()([m, n]) if res else n
+
+def level_block(m, dim, depth, inc, acti, do, bn, mp, up, res):
+    if depth > 0:
+        n = conv_block(m, dim, acti, bn, res)
+        m = TimeDistributed(MaxPooling2D())(n) if mp else TimeDistributed(Conv2D(dim, 4, strides=2, padding='same'))(n)
+        
+        print(n.shape)
+        print(m.shape)
+        
+        m = level_block(m, int(inc*dim), depth-1, inc, acti, do, bn, mp, up, res)
+        if up:
+            m = TimeDistributed(UpSampling2D())(m)
+            m = TimeDistributed(Conv2D(dim, 4, padding='same'))(m)
+            m = TimeDistributed(LeakyReLU())(m)
+        else:
+            m = TimeDistributed(Conv2DTranspose(dim, 4, strides=2, padding='same'))(m)
+            m = TimeDistributed(LeakyReLU())(m)
+            
+        n = Concatenate()([n, m])
+        m = conv_block(n, dim, acti, bn, res)
+    else:
+        m = conv_block(m, dim, acti, bn, res, do)
+        
+        l = TimeDistributed(Flatten())(m)
+        #l = LSTM(4 * 4 * 128, stateful=True, return_sequences=True)(l)
+        l = LSTM(2048, stateful=True, return_sequences=True)(l)
+        l = TimeDistributed(Reshape((2, 2, 2048/4)))(l)
+        m = l
+        #m = Concatenate()([l, m])
+        
+        m = conv_block(m, dim, acti, bn, res, do)
+    return m
+
+def UNet(input_shape, out_ch=1, start_ch=64, depth=7, inc_rate=1.5, activation='relu', 
+         dropout=0.4, batchnorm=True, maxpool=True, upconv=True, residual=False):
+    i = Input(batch_shape=input_shape)
+    o = TimeDistributed(ZeroPadding2D(padding=8))(i)
+    o = TimeDistributed(SeparableConv2D(start_ch, 7, padding='same'))(o)
+    o = level_block(o, start_ch, depth, inc_rate, activation, dropout, batchnorm, maxpool, upconv, residual)
+    o = TimeDistributed(Cropping2D(cropping=8))(o)
+    o = TimeDistributed(Conv2D(out_ch, 1, activation='tanh'))(o)
+    return Model(inputs=i, outputs=o)
+
+model = UNet((sequences_per_batch, train_seq, image_size, image_size, input_dimension), out_ch=6, start_ch=base)
+model.load_weights('v2.h5')
+model.compile(loss='mean_squared_error', optimizer=RMSprop())
+
+for k in model.layers:
+    print(k.output_shape)
+
+plot_model(model, to_file='model.png')
+
+def load_sequence(p, is_train=False):
+    pattern = p.decode("utf-8")
+    val = []
+    
+    for s in xrange(sequence_length):
+        name = pattern.format('test', sequence_start + s, folder)
+        try:
+            input_img = scipy.misc.imread(name, mode='L').astype(np.float)
+        except:
+            val.append(np.zeros((1, image_size, image_size, input_dimension + output_dimension)))
+            continue
+        images = np.split(input_img, input_dimension + output_dimension, axis=1)
+        
+        half_offset = 4
+        offset = half_offset * 2
+        hypersize = image_size + offset
+        fullsize = 256 + offset
+
+        h1 = int(np.ceil(np.random.uniform(1e-2, offset)))
+        w1 = int(np.ceil(np.random.uniform(1e-2, offset)))
+
+        conv = []
+        for image in images:
+            top = int((fullsize - image.shape[1]) / 2)
+            bottom = fullsize - image.shape[1] - top
+            image = np.append(np.zeros((image.shape[0], top)), image, axis=1)
+            image = np.append(image, np.zeros((image.shape[0], bottom)), axis=1)
+            
+            left = int((fullsize - image.shape[0]) / 2)
+            right = fullsize - image.shape[0] - left
+            image = np.append(np.zeros((left, image.shape[1])), image, axis=0)
+            image = np.append(image, np.zeros((right, image.shape[1])), axis=0)
+
+            tmp = scipy.misc.imresize(image, [hypersize, hypersize], interp='nearest')
+            if is_train:
+                image = tmp[h1:h1+image_size, w1:w1+image_size]
+            else:
+                image = tmp[half_offset:half_offset+image_size, half_offset:half_offset+image_size]
+            image = image/127.5
+        
+            conv.append(image)
+        
+        #print(np.stack(conv, axis=2).shape)
+        val.append([np.stack(conv, axis=2)])
+
+    st = np.stack(val, axis=1)
+    #z = np.zeros((1, sequence_length - st.shape[1], image_size, image_size, input_dimension + output_dimension)) 
+    #o = np.append(z, st, axis=1)
+    o = st
+    o = o - 1
+    return o
+   
+def makeMask(gt, ct):
+    gt = (gt+1) / 2
+    ct = (ct+1) / 2
+    
+    t_mask = np.clip(gt - ct, 0, 1)
+    n_mask = np.clip(ct - gt, 0, 1)
+    
+    t_mask = (t_mask * 2) - 1
+    n_mask = (n_mask * 2) - 1
+    
+    return np.concatenate((t_mask, n_mask), axis=4)
+   
+def extractGT(seq):
+    gt, data = np.split(batch_sequence, [output_dimension], axis=4)
+    gta, gtb, gtc = np.split(gt, 3, axis=4)
+    z1, z2, z3, z4, cta, ctb, ctc = np.split(data, input_dimension, axis=4)
+    
+    m1 = makeMask(gta, cta)
+    m2 = makeMask(gtb, ctb)
+    m3 = makeMask(gtc, ctc)
+    
+    gt = np.concatenate((m1, m2, m3), axis=4)
+    return data, gt, np.concatenate((cta, ctb, ctc), axis=4)
+    
+def combine(e, g, p1, q1):
+    p, m = np.split(e, 2, axis=4)
+    return np.sign(g + np.sign(p-p1) - np.sign(m-q1))
+    
+def merge(yo, error, p, q):
+    ae, be, ce = np.split(error, 3, axis=4)
+    ag, bg, cg = np.split(yo, 3, axis=4)
+    
+    a = combine(ae, ag, p, q)
+    b = combine(be, bg, p, q)
+    c = combine(ce, cg, p, q)
+    
+    return np.concatenate((a, b, c), axis=4)
+    
+def wrt(yo, error, name, p, q, c):
+    out = merge(yo, error, p, q)
+        
+    all = np.append(batch_sequence, out, axis=4)
+    all = all.reshape((train_seq, image_size, image_size, 13))
+    sp = np.split(all, train_seq, axis=0)
+    sp = [s.reshape((image_size, image_size, 13)) for s in sp]
+
+    haa = np.concatenate(sp, axis=0)
+    jaa = np.concatenate(np.split(haa, 13, axis=2), axis=1)
+    fa = (jaa+1.)/2.
+    yo = np.concatenate((fa, fa, fa), axis=2)
+    scipy.misc.imsave(files[sequence].format('out', c, name), yo)
+    
+# test
+number_of_sequences = files.size  
+
+for sequence in range(number_of_sequences):
+    print('S: {} '.format(sequence))
+    seq = load_sequence(files[sequence])
+    batch_sequences = np.split(seq, train_cnt, axis=1)
+    model.reset_states()
+        
+    c = 0
+    for batch_sequence in batch_sequences:
+        data, gt, yo = extractGT(batch_sequence)
+        error = model.predict_on_batch(data)
+        
+        wrt(yo, error, 'o1', 0.5, 0.5, c)
+        wrt(yo, error, 'o2', 0.3, 0.8, c)
+        wrt(yo, error, 'o3', 0.8, 0.3, c)
+        
+        c = c + 1
+    
